@@ -120,47 +120,58 @@ function Find-WeeklyPdfUrl {
     param([string]$Html, [string]$PageUrl)
 
     $candidates = [System.Collections.Generic.List[object]]::new()
-    $anchorPattern = '(?is)<a\b(?<attrs>[^>]*)>(?<text>.*?)</a>'
-    foreach ($match in [regex]::Matches($Html, $anchorPattern)) {
-        $hrefMatch = [regex]::Match($match.Groups['attrs'].Value, '(?is)\bhref\s*=\s*(?:"(?<v>[^"]*)"|''(?<v>[^'']*)''|(?<v>[^\s>]+))')
-        if (-not $hrefMatch.Success) { continue }
-
-        $href = [System.Net.WebUtility]::HtmlDecode($hrefMatch.Groups['v'].Value)
-        $text = [System.Net.WebUtility]::HtmlDecode(($match.Groups['text'].Value -replace '<[^>]+>', ' '))
-        if ($href -notmatch '(?i)release-menu-pdfs|\.pdf(?:\?|$)') { continue }
-
-        try { $absoluteUri = [Uri]::new([Uri]$PageUrl, $href) } catch { continue }
-        if ($absoluteUri.Scheme -notin @('http', 'https')) { continue }
-        $decodedPath = [Uri]::UnescapeDataString($absoluteUri.AbsolutePath)
-        $isWeeklyMenu = ($decodedPath -match '(?i)release-menu-pdfs') -or
-            (($decodedPath -match '(?i)Mittagsmen') -and ($text -match '(?i)Wochen|Download|Menüplan'))
-        if (-not $isWeeklyMenu) { continue }
-
-        $score = 0
-        if ($text -match '(?i)Wochenmen[uü]plan') { $score += 10 }
-        if ($text -match '(?i)Download') { $score += 5 }
-        if ($decodedPath -match '(?i)release-menu-pdfs') { $score += 3 }
-        $candidates.Add([pscustomobject]@{ Uri = $absoluteUri; Score = $score; Text = $text })
-    }
-
-    # Manche Versionen der SV Seite legen den Qnips Link nicht als sichtbaren
-    # <a href> Eintrag ab, sondern in JSON oder einem data Attribut. Als Fallback
-    # werden nur Qnips Wochenmenü URLs direkt im gerenderten DOM gesucht.
     $searchHtml = [System.Net.WebUtility]::HtmlDecode($Html)
     $searchHtml = $searchHtml -replace '\\/', '/' -replace '\\u0026', '&' -replace '\\u003d', '='
+    $anchorPattern = '(?is)<a\b(?<attrs>[^>]*)>(?<inner>.*?)</a>'
+    $uriAttributePattern = '(?is)\b(?:href|data-href|data-url|data-download-url)\s*=\s*(?:"(?<v>[^"]*)"|''(?<v>[^'']*)''|(?<v>[^\s>]+))'
+
+    foreach ($match in [regex]::Matches($searchHtml, $anchorPattern)) {
+        $attrs = $match.Groups['attrs'].Value
+        $inner = $match.Groups['inner'].Value
+        $label = [System.Net.WebUtility]::HtmlDecode(($inner -replace '(?is)<[^>]+>', ' '))
+        $label = ($label -replace '[\s\u00a0]+', ' ').Trim()
+        $labelAttribute = [regex]::Match($attrs, '(?is)\b(?:aria-label|title|alt)\s*=\s*(?:"(?<v>[^"]*)"|''(?<v>[^'']*)''|(?<v>[^\s>]+))')
+        $isPlanLabel = ($label -match '(?i)^Wochenmen[uü]plan$') -or
+            ($labelAttribute.Success -and [System.Net.WebUtility]::HtmlDecode($labelAttribute.Groups['v'].Value).Trim() -match '(?i)^Wochenmen[uü]plan$')
+
+        $uriValues = [System.Collections.Generic.List[string]]::new()
+        foreach ($attrMatch in [regex]::Matches($attrs, $uriAttributePattern)) {
+            $value = [System.Net.WebUtility]::HtmlDecode($attrMatch.Groups['v'].Value).Trim()
+            if ($value -and $value -notin @('#','javascript:void(0)','javascript:void(0);')) { $uriValues.Add($value) }
+        }
+        if ($uriValues.Count -eq 0 -and $isPlanLabel) {
+            foreach ($urlMatch in [regex]::Matches($match.Value, '(?i)(?:https?:)?//[^"''<>\s]+|/release-menu-pdfs/[^"''<>\s]+')) {
+                $uriValues.Add($urlMatch.Value)
+            }
+        }
+
+        foreach ($value in $uriValues) {
+            $value = $value.TrimEnd([char[]]@(')',']','}',',',';'))
+            try { $absoluteUri = [Uri]::new([Uri]$PageUrl, $value) } catch { continue }
+            if ($absoluteUri.Scheme -notin @('http','https')) { continue }
+            $score = if ($isPlanLabel) { 100 } else { 0 }
+            if ($absoluteUri.AbsolutePath -match '(?i)release-menu-pdfs') { $score += 10 }
+            if ($absoluteUri.AbsolutePath -match '(?i)\.pdf$') { $score += 5 }
+            if ($score -gt 0) { $candidates.Add([pscustomobject]@{ Uri = $absoluteUri; Score = $score; Text = $label }) }
+        }
+    }
+
+    # Fallback for a Qnips URL embedded in page data rather than an anchor.
     $rawUrlPattern = '(?i)(?<url>(?:https?:)?//[^"''<>\s]*release-menu-pdfs/[^"''<>\s]*?\.pdf(?:\?[^"''<>\s]*)?|/release-menu-pdfs/[^"''<>\s]*?\.pdf(?:\?[^"''<>\s]*)?)'
     foreach ($rawMatch in [regex]::Matches($searchHtml, $rawUrlPattern)) {
         $rawUrl = $rawMatch.Groups['url'].Value.TrimEnd([char[]]@(')',']','}',',',';'))
         if ($rawUrl.StartsWith('//')) { $rawUrl = 'https:' + $rawUrl }
         try { $absoluteUri = [Uri]::new([Uri]$PageUrl, $rawUrl) } catch { continue }
-        if ($absoluteUri.Scheme -notin @('http','https')) { continue }
-        $candidates.Add([pscustomobject]@{ Uri = $absoluteUri; Score = 8; Text = 'embedded qnips url' })
+        if ($absoluteUri.Scheme -in @('http','https')) {
+            $candidates.Add([pscustomobject]@{ Uri = $absoluteUri; Score = 20; Text = 'embedded qnips url' })
+        }
     }
 
     if ($candidates.Count -eq 0) {
-        $anchorCount = [regex]::Matches($Html, '(?is)<a\b').Count
-        $pdfMentionCount = [regex]::Matches($searchHtml, '(?i)release-menu-pdfs|\.pdf').Count
-        throw "Kein Wochenmenü PDF Link gefunden. Diagnose: $anchorCount Links und $pdfMentionCount PDF Hinweise im gerenderten DOM. Die Linksuche hat keine URL ausgegeben."
+        $anchorCount = [regex]::Matches($searchHtml, '(?is)<a\b').Count
+        $labelCount = [regex]::Matches($searchHtml, '(?i)Wochenmen[uü]plan').Count
+        $qnipsCount = [regex]::Matches($searchHtml, '(?i)release-menu-pdfs|files\.qnips\.com').Count
+        throw "Kein Link zum Eintrag Wochenmenüplan gefunden. Diagnose: $anchorCount Links, $labelCount Treffer zum Eintragstext und $qnipsCount Qnips Hinweise im Seiteninhalt."
     }
     return ($candidates | Sort-Object Score -Descending | Select-Object -First 1).Uri
 }
