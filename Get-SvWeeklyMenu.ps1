@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$MenuPageUrl = 'https://sv-gastronomie.ch/menu/Galexis%20AG,%20dailys,%20Niederbipp/Mittagsmen%C3%BC',
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'public'),
@@ -143,8 +143,24 @@ function Find-WeeklyPdfUrl {
         $candidates.Add([pscustomobject]@{ Uri = $absoluteUri; Score = $score; Text = $text })
     }
 
+    # Manche Versionen der SV Seite legen den Qnips Link nicht als sichtbaren
+    # <a href> Eintrag ab, sondern in JSON oder einem data Attribut. Als Fallback
+    # werden nur Qnips Wochenmenü URLs direkt im gerenderten DOM gesucht.
+    $searchHtml = [System.Net.WebUtility]::HtmlDecode($Html)
+    $searchHtml = $searchHtml -replace '\\/', '/' -replace '\\u0026', '&' -replace '\\u003d', '='
+    $rawUrlPattern = '(?i)(?<url>(?:https?:)?//[^"''<>\s]*release-menu-pdfs/[^"''<>\s]*?\.pdf(?:\?[^"''<>\s]*)?|/release-menu-pdfs/[^"''<>\s]*?\.pdf(?:\?[^"''<>\s]*)?)'
+    foreach ($rawMatch in [regex]::Matches($searchHtml, $rawUrlPattern)) {
+        $rawUrl = $rawMatch.Groups['url'].Value.TrimEnd([char[]]@(')',']','}',',',';'))
+        if ($rawUrl.StartsWith('//')) { $rawUrl = 'https:' + $rawUrl }
+        try { $absoluteUri = [Uri]::new([Uri]$PageUrl, $rawUrl) } catch { continue }
+        if ($absoluteUri.Scheme -notin @('http','https')) { continue }
+        $candidates.Add([pscustomobject]@{ Uri = $absoluteUri; Score = 8; Text = 'embedded qnips url' })
+    }
+
     if ($candidates.Count -eq 0) {
-        throw 'Auf der gerenderten Menüseite wurde kein Wochenmenü PDF Link gefunden. Prüfe, ob die SV Seite ihre Download Schaltfläche geändert hat.'
+        $anchorCount = [regex]::Matches($Html, '(?is)<a\b').Count
+        $pdfMentionCount = [regex]::Matches($searchHtml, '(?i)release-menu-pdfs|\.pdf').Count
+        throw "Kein Wochenmenü PDF Link gefunden. Diagnose: $anchorCount Links und $pdfMentionCount PDF Hinweise im gerenderten DOM. Die Linksuche hat keine URL ausgegeben."
     }
     return ($candidates | Sort-Object Score -Descending | Select-Object -First 1).Uri
 }
@@ -378,7 +394,18 @@ try {
     $pdfTools = Get-PopplerTools -DestinationDirectory $ToolsDirectory -WorkDirectory $workDirectory -Version $popplerVersion -ExpectedSha256 $popplerSha256
     Write-Host 'Lade Menüseite und suche den aktuellen PDF Download ...'
     $pageHtml = Get-RenderedPageHtml -Browser $browser -Url $MenuPageUrl -WorkDirectory $workDirectory
-    $pdfUri = Find-WeeklyPdfUrl -Html $pageHtml -PageUrl $MenuPageUrl
+    try {
+        $pdfUri = Find-WeeklyPdfUrl -Html $pageHtml -PageUrl $MenuPageUrl
+    } catch {
+        Write-Host 'Kein PDF Link im gerenderten DOM. Prüfe ergänzend den HTML Seiteninhalt ...'
+        try {
+            $staticResponse = Invoke-WebRequest -Uri $MenuPageUrl -MaximumRedirection 5 -TimeoutSec 60
+            $combinedHtml = $pageHtml + "`n" + [string]$staticResponse.Content
+            $pdfUri = Find-WeeklyPdfUrl -Html $combinedHtml -PageUrl $MenuPageUrl
+        } catch {
+            throw 'Die Menüseite lieferte weder im gerenderten DOM noch im HTML Quelltext einen Wochenmenü PDF Link. Der Download wurde nicht verändert und es wurde keine Ausgabe veröffentlicht.'
+        }
+    }
     $decodedName = [Uri]::UnescapeDataString([System.IO.Path]::GetFileName($pdfUri.AbsolutePath))
     if ($decodedName -notmatch '(?i)_(?<week>\d{1,2})_(?<date>\d{8})_') { throw "Unerwartetes Wochenmenü PDF Dateimuster: $decodedName" }
     $fileWeek = [int]$Matches.week
