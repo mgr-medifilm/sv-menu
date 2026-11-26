@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import Page, sync_playwright
@@ -49,6 +49,8 @@ TRIGGER_TEXT = re.compile(
     r"drucken|print|speichern|export",
     re.I,
 )
+# Nur Kandidaten, die hierauf passen, werden akzeptiert (verhindert z.B. das Catering-PDF)
+MUST_MATCH = re.compile(r"release-menu-pdfs|mittagsmen", re.I)
 SCORE_KEYWORDS = ("woche", "week", "wochen", "menu", "menü", "kw")
 
 
@@ -148,13 +150,23 @@ def click_triggers(page: Page, col: Collector, timeout_ms: int = 6000) -> None:
             # kein Popup/Download: Navigation oder DOM-Änderung prüfen
             if page.url != start_url:
                 col.add(page.url, "click:navigation")
-                page.goto(start_url, wait_until="networkidle")
+                page.goto(start_url, wait_until="domcontentloaded")
         scan_dom(page, col)
 
 
 def score(url: str) -> int:
-    u = url.lower()
-    return sum(1 for k in SCORE_KEYWORDS if k in u)
+    u = unquote(url).lower()
+    pts = sum(1 for k in SCORE_KEYWORDS if k in u)
+    if "mittagsmen" in u:
+        pts += 5
+    if "release-menu-pdfs" in u:
+        pts += 3
+    kw = datetime.now().isocalendar().week
+    if re.search(rf"_{kw}_\d{{8}}", u):
+        pts += 4  # Datei der aktuellen Kalenderwoche
+    if "catering_" in u:
+        pts -= 3
+    return pts
 
 
 def verify(ctx, url: str, min_bytes: int) -> dict | None:
@@ -180,7 +192,7 @@ def verify(ctx, url: str, min_bytes: int) -> dict | None:
     }
 
 
-def run_once(url: str, debug_dir: Path, min_bytes: int, headless: bool) -> dict | None:
+def run_once(url: str, debug_dir: Path, min_bytes: int, headless: bool, max_wait_s: int = 45) -> dict | None:
     col = Collector(base_url=url)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -191,15 +203,16 @@ def run_once(url: str, debug_dir: Path, min_bytes: int, headless: bool) -> dict 
         page = ctx.new_page()
         page.on("response", col.on_response)
         try:
-            page.goto(url, wait_until="networkidle", timeout=60000)
-            page.wait_for_timeout(2500)  # späte Renderings abwarten
-            scan_dom(page, col)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except PWError as e:
+                log(f"goto-Warnung (wird ignoriert, Kandidaten werden trotzdem geprüft): {e}".split("\n")[0])
 
-            result = _first_valid(ctx, col, min_bytes)
+            result = wait_for_valid(page, ctx, col, min_bytes, max_wait_s)
             if not result:
+                log("Kein Treffer durch passives Sammeln, versuche Klicks")
                 click_triggers(page, col)
-                page.wait_for_timeout(1500)
-                result = _first_valid(ctx, col, min_bytes)
+                result = wait_for_valid(page, ctx, col, min_bytes, 8)
 
             if not result:
                 debug_dir.mkdir(parents=True, exist_ok=True)
@@ -220,30 +233,59 @@ def run_once(url: str, debug_dir: Path, min_bytes: int, headless: bool) -> dict 
             browser.close()
 
 
-def _first_valid(ctx, col: Collector, min_bytes: int) -> dict | None:
+def _first_valid(ctx, col: Collector, min_bytes: int, failed: set | None = None) -> dict | None:
+    failed = failed if failed is not None else set()
+    valid = []
     for cand in sorted(col.candidates, key=score, reverse=True):
+        if cand in failed:
+            continue
+        if not MUST_MATCH.search(unquote(cand)):
+            continue
         res = verify(ctx, cand, min_bytes)
         if res:
-            return res
+            valid.append(res)
+        else:
+            failed.add(cand)
+    # bester verifizierter Kandidat nach Score
+    return max(valid, key=lambda r: score(r["url"]), default=None)
+
+
+def wait_for_valid(page: Page, ctx, col: Collector, min_bytes: int, max_wait_s: int) -> dict | None:
+    """Pollt, bis ein verifizierbarer Kandidat da ist (statt auf networkidle zu warten)."""
+    failed: set = set()
+    deadline = time.time() + max_wait_s
+    while time.time() < deadline:
+        scan_dom(page, col)
+        res = _first_valid(ctx, col, min_bytes, failed)
+        if res:
+            # kurz nachwarten, falls noch ein besser passender Link nachgeladen wird
+            page.wait_for_timeout(2000)
+            scan_dom(page, col)
+            return _first_valid(ctx, col, min_bytes) or res
+        page.wait_for_timeout(1000)
     return None
 
 
 def main() -> int:
+    global MUST_MATCH
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--url", default=os.getenv("MENU_URL", DEFAULT_URL))
     ap.add_argument("--json-out", type=Path, default=Path("menu_pdf.json"))
     ap.add_argument("--save-pdf", type=Path, help="PDF zusätzlich lokal speichern (optional)")
     ap.add_argument("--debug-dir", type=Path, default=Path("debug"))
     ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--must-match", default=MUST_MATCH.pattern, help="Regex, die die PDF-URL erfüllen muss")
+    ap.add_argument("--max-wait", type=int, default=45, help="Sekunden, die auf den PDF-Link gewartet wird")
     ap.add_argument("--min-bytes", type=int, default=5000)
     ap.add_argument("--headed", action="store_true", help="Browser sichtbar (lokales Debugging)")
     args = ap.parse_args()
+    MUST_MATCH = re.compile(args.must_match, re.I)
 
     result = None
     for attempt in range(1, args.retries + 1):
         log(f"Versuch {attempt}/{args.retries}")
         try:
-            result = run_once(args.url, args.debug_dir, args.min_bytes, not args.headed)
+            result = run_once(args.url, args.debug_dir, args.min_bytes, not args.headed, args.max_wait)
         except Exception as e:
             log(f"Fehler in Versuch {attempt}: {e!r}")
         if result:
