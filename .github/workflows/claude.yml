@@ -1,0 +1,44 @@
+name: Menü-PDF-Link
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"   # jeden Montag 05:00 UTC (Menü der neuen Woche)
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+      - run: playwright install --with-deps chromium
+
+      - name: PDF-Link ermitteln und verifizieren
+        id: menu
+        run: python fetch_menu_pdf.py --save-pdf out/menu.pdf --json-out out/menu_pdf.json
+
+      - name: Ergebnis
+        run: echo "PDF-URL = ${{ steps.menu.outputs.pdf_url }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: menu-pdf
+          path: out/
+
+      - name: Debug-Artefakte bei Fehler
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
